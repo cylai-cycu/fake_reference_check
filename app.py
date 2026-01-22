@@ -1,4 +1,4 @@
-# app.py (One-Click Citation Report Automation - Local Enhanced Version)
+# app.py (All-in-One Version)
 
 import streamlit as st
 import pandas as pd
@@ -10,197 +10,475 @@ import difflib
 import subprocess
 import shutil
 import sys
+import requests
+import urllib3
+import tempfile
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from difflib import SequenceMatcher
 
-# ==============================================================================
-# 1. 自動安裝與設定 AnyStyle (針對雲端環境修正)
-# ==============================================================================
-def install_and_setup_anystyle():
-    # 避免在 Streamlit 重跑 script 時重複執行輸出，雖非必須但可讓 log 乾淨點
-    if "anystyle_setup_done" in st.session_state:
-        return
-
-    print("🔄 開始檢查 AnyStyle 環境...")
-    
-    # (A) 嘗試安裝 (如果尚未安裝)
-    if shutil.which("anystyle") is None:
-        print("⚠️ 尚未偵測到 anystyle，嘗試透過 gem 安裝...")
-        try:
-            # 先嘗試全域安裝
-            subprocess.run(["gem", "install", "anystyle-cli"], check=True)
-            print("✅ Gem 全域安裝成功")
-        except subprocess.CalledProcessError:
-            try:
-                # 若失敗則嘗試 user install
-                subprocess.run(["gem", "install", "--user-install", "anystyle-cli"], check=True)
-                print("✅ Gem 使用者安裝成功")
-            except Exception as e:
-                print(f"❌ 安裝失敗: {e}")
-
-    # (B) 強制將 Gem 的 bin 目錄加入 PATH
-    # 這是最關鍵的一步，解決找不到指令的問題
-    try:
-        result = subprocess.run(["gem", "environment", "bin"], capture_output=True, text=True)
-        if result.returncode == 0:
-            gem_bin_path = result.stdout.strip()
-            current_path = os.environ.get("PATH", "")
-            
-            if gem_bin_path not in current_path:
-                print(f"🔧 將 Gem 路徑加入系統 PATH: {gem_bin_path}")
-                os.environ["PATH"] += os.pathsep + gem_bin_path
-            
-    except Exception as e:
-        print(f"❌ 路徑設定發生錯誤: {e}")
-        
-    st.session_state["anystyle_setup_done"] = True
-
-# 執行安裝檢查
-install_and_setup_anystyle()
-
-# ==============================================================================
-# 2. 匯入自定義模組 (包含錯誤處理)
-# ==============================================================================
+# 嘗試匯入 SerpAPI，如果沒安裝則提供假物件避免報錯
 try:
-    from modules.parsers import parse_references_with_anystyle
-    from modules.local_db import load_csv_data, search_local_database
-    from modules.api_clients import (
-        get_scopus_key,
-        get_serpapi_key,
-        search_crossref_by_doi,
-        search_crossref_by_text,
-        search_scopus_by_title,
-        search_scholar_by_title,
-        search_scholar_by_ref_text,
-        search_s2_by_title,
-        search_openalex_by_title,
-        check_url_availability
-    )
-except ModuleNotFoundError as e:
-    # 這裡就是您原本缺少 except 的地方
-    st.error(f"❌ 程式啟動失敗：找不到必要的模組檔案。請檢查 'modules' 資料夾是否已完整上傳。\n錯誤訊息: {e}")
-    st.stop()
+    from serpapi import GoogleSearch
+except ImportError:
+    GoogleSearch = None
 
 # ==============================================================================
-# 3. Streamlit 頁面設定與主程式
+# 0. Streamlit 頁面設定 (必須是第一個 Streamlit 指令)
 # ==============================================================================
 st.set_page_config(
-    page_title="Citation Verification Report Tool",
-    page_icon="📊",
+    page_title="Citation Verification Tool",
+    page_icon="📚",
     layout="wide"
 )
 
-st.markdown("""
-<style>
-    .main-header { font-size: 2.2rem; font-weight: bold; text-align: center; color: #4F46E5; margin-bottom: 5px; }
-    .sub-header { text-align: center; color: #6B7280; margin-bottom: 2rem; }
-    .status-badge { padding: 4px 10px; border-radius: 12px; font-size: 0.85em; font-weight: bold; }
-    .ref-box { background-color: #F9FAFB; padding: 12px; border-radius: 8px; font-family: 'Courier New', monospace; font-size: 0.9em; border: 1px solid #E5E7EB; margin-top: 5px; }
-    .report-card { background-color: #FFFFFF; padding: 20px; border-radius: 10px; border: 1px solid #E5E7EB; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-</style>
-""", unsafe_allow_html=True)
+# ==============================================================================
+# 1. 環境設定與 AnyStyle 安裝邏輯
+# ==============================================================================
+def install_and_setup_anystyle():
+    """
+    自動檢測並修復 AnyStyle 執行環境 (Ruby Gem)
+    """
+    if "anystyle_setup_done" in st.session_state:
+        return
 
-# ========== Session State ==========
-if "results" not in st.session_state:
-    st.session_state.results = []
+    # print 用於後台 Log，不會影響 Streamlit 介面順序
+    print("🔄 [System] 初始化 AnyStyle 環境...")
+    
+    # 步驟 A: 安裝 (僅使用 user install 以避開權限問題)
+    if shutil.which("anystyle") is None:
+        try:
+            print("⚠️ 尚未偵測到指令，開始安裝...")
+            subprocess.run(
+                ["gem", "install", "--user-install", "anystyle-cli"], 
+                check=True, 
+                capture_output=True
+            )
+            print("✅ Gem 使用者安裝成功")
+        except Exception as e:
+            print(f"❌ 安裝失敗 (可能是網路或 Ruby 未安裝): {e}")
 
-# ========== Core Utility Functions ==========
-def format_name_field(data):
-    if not data:
+    # 步驟 B: 路徑修復 (將 Gem bin 加入 PATH)
+    try:
+        # 詢問 Ruby 使用者目錄在哪
+        ruby_user_dir = subprocess.check_output(
+            ["ruby", "-e", "puts Gem.user_dir"], 
+            text=True
+        ).strip()
+        
+        user_bin_path = os.path.join(ruby_user_dir, "bin")
+        current_path = os.environ.get("PATH", "")
+        
+        if user_bin_path not in current_path:
+            print(f"🔧 修復 PATH: {user_bin_path}")
+            os.environ["PATH"] += os.pathsep + user_bin_path
+            
+    except Exception:
+        pass
+        
+    st.session_state["anystyle_setup_done"] = True
+
+# 執行環境檢查
+install_and_setup_anystyle()
+
+# ==============================================================================
+# 2. 功能模組：Parser (整合自 parsers.py)
+# ==============================================================================
+
+def get_anystyle_path():
+    # 優先使用系統找到的
+    path = shutil.which("anystyle")
+    if path: return path
+    # 備用：推算使用者路徑
+    try:
+        user_dir = subprocess.check_output(["ruby", "-e", "puts Gem.user_dir"], text=True).strip()
+        return os.path.join(user_dir, "bin", "anystyle")
+    except:
+        return "anystyle"
+
+ANYSTYLE_CMD = get_anystyle_path()
+
+def clean_title(text):
+    if not text: return ""
+    # 正規化 unicode (例如將 full-width 轉 half-width)
+    text = unicodedata.normalize("NFKC", str(text))
+    # 移除破折號等干擾字元
+    dash_chars = ["-", "–", "—", "−", "‐"]
+    for d in dash_chars:
+        text = text.replace(d, "")
+    # 只保留字母與數字，轉小寫
+    cleaned = [ch.lower() for ch in text if unicodedata.category(ch)[0] in ("L", "N", "Z")]
+    return re.sub(r"\s+", " ", "".join(cleaned)).strip()
+
+def parse_references_with_anystyle(raw_text):
+    if not raw_text or not raw_text.strip():
+        return [], []
+
+    lines = [line.strip() for line in raw_text.split('\n') if line.strip()]
+    structured_refs = []
+    
+    # 這裡假設 custom.mod 在同一目錄下，如果沒有就忽略
+    use_custom_model = os.path.exists("custom.mod")
+
+    # 建立 UI 進度條
+    progress_bar = st.progress(0)
+    
+    for i, line in enumerate(lines):
+        has_chinese = bool(re.search(r'[\u4e00-\u9fff]', line))
+        
+        cmd = [ANYSTYLE_CMD]
+        if has_chinese and use_custom_model:
+            cmd.extend(["-P", "custom.mod"])
+        cmd.extend(["-f", "json", "parse"])
+        
+        try:
+            # 使用 stdin 傳入資料 (比寫檔快且穩)
+            process = subprocess.run(
+                cmd,
+                input=line,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=True
+            )
+            
+            output = process.stdout.strip()
+            # 擷取 JSON
+            if not output.startswith("["):
+                 match = re.search(r"\[.*\]", output, re.DOTALL)
+                 if match: output = match.group(0)
+            
+            data = ast.literal_eval(output) # 或 json.loads
+            
+            for item in data:
+                # 簡易資料清洗
+                for k, v in item.items():
+                    if isinstance(v, list):
+                        # author 欄位特殊處理
+                        if k == 'author':
+                            authors = []
+                            for a in v:
+                                if isinstance(a, dict):
+                                    parts = [p for p in [a.get("given"), a.get("family")] if p]
+                                    authors.append(" ".join(parts))
+                                else:
+                                    authors.append(str(a))
+                            item["authors"] = ", ".join(authors)
+                        else:
+                            item[k] = "; ".join([str(x) for x in v])
+
+                item["text"] = line
+                # 確保有 title
+                if "title" not in item: item["title"] = "N/A"
+                
+                structured_refs.append(item)
+                
+        except Exception as e:
+            # 失敗時保留原始文字
+            structured_refs.append({"text": line, "title": "Parse Error", "error": str(e)})
+
+        progress_bar.progress((i + 1) / len(lines))
+
+    return lines, structured_refs
+
+# ==============================================================================
+# 3. 功能模組：Local DB (整合自 local_db.py)
+# ==============================================================================
+
+def load_csv_data(uploaded_file):
+    if uploaded_file is None:
         return None
     try:
-        if isinstance(data, str):
-            if not (data.startswith('[') or data.startswith('{')):
-                return data
-            try:
-                data = ast.literal_eval(data)
-            except:
-                return data
-        names_list = []
-        data_list = data if isinstance(data, list) else [data]
-        for item in data_list:
-            if isinstance(item, dict):
-                parts = [item.get('family', ''), item.get('given', '')]
-                names_list.append(", ".join([p for p in parts if p]))
+        return pd.read_csv(uploaded_file)
+    except UnicodeDecodeError:
+        try:
+            uploaded_file.seek(0)
+            return pd.read_csv(uploaded_file, encoding='big5')
+        except Exception as e:
+            st.error(f"讀取 CSV 失敗: {e}")
+            return None
+
+def search_local_database(df, title_column, query_title, threshold=0.8):
+    if df is None or not title_column or not query_title:
+        return None, None
+
+    clean_query = clean_title(query_title)
+    best_score = 0
+    best_match_row = None
+
+    # 簡單遍歷搜尋
+    for index, row in df.iterrows():
+        db_title = str(row[title_column])
+        clean_db_title = clean_title(db_title)
+        
+        # 快速過濾
+        if clean_query in clean_db_title or clean_db_title in clean_query:
+            score = 1.0
+        else:
+            score = SequenceMatcher(None, clean_query, clean_db_title).ratio()
+        
+        if score > best_score:
+            best_score = score
+            best_match_row = row
+
+    if best_score >= threshold:
+        return best_match_row, best_score
+    return None, 0
+
+# ==============================================================================
+# 4. 功能模組：API Clients (整合自 api_clients.py)
+# ==============================================================================
+
+S2_API_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
+OPENALEX_API_URL = "https://api.openalex.org/works"
+MAX_RETRIES = 2
+TIMEOUT = 10
+
+def _read_key_file(filename):
+    try:
+        with open(filename, "r") as f: return f.read().strip()
+    except: return None
+
+def get_scopus_key():
+    return st.secrets.get("scopus_api_key") or _read_key_file("scopus_key.txt")
+
+def get_serpapi_key():
+    return st.secrets.get("serpapi_key") or _read_key_file("serpapi_key.txt")
+
+def _check_author_match(query_author, result_authors_list):
+    """
+    作者比對邏輯 (Zhang, X. vs L. Zhang)
+    """
+    if not query_author or len(query_author) < 2: return True 
+    
+    query_author = query_author.lower().strip()
+    q_family = ""
+    q_given_initial = ""
+
+    if "," in query_author:
+        parts = query_author.split(",")
+        q_family = parts[0].strip()
+        if len(parts) > 1 and parts[1].strip():
+            q_given_initial = parts[1].strip()[0] 
+    else:
+        parts = query_author.split()
+        q_family = parts[-1].strip()
+        if len(parts) > 1:
+            q_given_initial = parts[0].strip()[0]
+
+    common_names = ['wang', 'chen', 'lee', 'li', 'zhang', 'liu', 'lin', 'yang', 'huang', 'wu', 'smith', 'jones']
+    is_common_name = (q_family in common_names)
+
+    for auth in result_authors_list:
+        r_family = ""
+        r_given_initial = ""
+        r_full = ""
+
+        if isinstance(auth, dict):
+            r_family = str(auth.get('family') or auth.get('surname') or '').lower()
+            given = str(auth.get('given') or auth.get('initials') or '').lower()
+            if given: r_given_initial = given[0]
+            r_full = f"{given} {r_family}".strip()
+        else:
+            r_full = str(auth).lower()
+            if " " in r_full:
+                r_family = r_full.split()[-1]
+                r_given_initial = r_full.split()[0][0]
             else:
-                names_list.append(str(item))
-        return "; ".join(names_list)
-    except:
-        return str(data)
+                r_family = r_full
+
+        if q_family == r_family or q_family in r_full:
+            if is_common_name and q_given_initial and r_given_initial:
+                if q_given_initial != r_given_initial:
+                    continue 
+            return True
+    return False
+
+def _is_match(query, result):
+    if not query or not result: return False
+    c_q = clean_title(query)
+    c_r = clean_title(result)
+    
+    def remove_noise(text):
+        text = re.sub(r'\b(19|20)\d{2}\b', '', text)
+        text = re.sub(r'\b(arxiv|biorxiv|available|online|access)\b', '', text, flags=re.IGNORECASE)
+        return " ".join(text.split())
+
+    c_q = remove_noise(c_q)
+    c_r = remove_noise(c_r)
+
+    if len(c_q) > len(c_r) * 1.5:
+        if c_r in c_q: return True
+
+    ratio = SequenceMatcher(None, c_q, c_r).ratio()
+    if ratio >= 0.65: return True
+    
+    q_words = set(c_q.split())
+    r_words = set(c_r.split())
+    stop_words = {'a', 'an', 'the', 'of', 'in', 'for', 'with', 'on', 'at', 'by', 'and', 'from', 'to'}
+    missing = [w for w in q_words if w not in stop_words and w not in r_words]
+    
+    if len(missing) <= 1 and len(q_words) >= 5: return True
+    if len(missing) == 0 and len(c_q) > len(c_r) * 0.3: return True
+
+    return False
+
+def _call_external_api_with_retry(url, params, headers=None):
+    if not headers: headers = {'User-Agent': 'ReferenceChecker/1.0'}
+    for _ in range(MAX_RETRIES):
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=TIMEOUT)
+            if response.status_code == 200: return response.json(), "OK"
+            if response.status_code in [401, 403]: return None, f"Auth Error ({response.status_code})"
+        except: pass
+    return None, "Error"
+
+# --- 各個 API 實作 ---
+
+def search_crossref_by_doi(doi, target_title=None):
+    if not doi: return None, None, "Empty DOI"
+    clean_doi = doi.strip(' ,.;)]}>')
+    url = f"https://api.crossref.org/works/{clean_doi}"
+    try:
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            item = response.json().get("message", {})
+            titles = item.get("title", [])
+            res_title = titles[0] if titles else ""
+            if target_title and not _is_match(target_title, res_title):
+                return None, None, f"DOI Title Mismatch"
+            return res_title, item.get("URL") or f"https://doi.org/{clean_doi}", "OK"
+        return None, None, f"HTTP {response.status_code}"
+    except: return None, None, "Conn Error"
+
+def search_crossref_by_text(title, author=None):
+    if not title: return None, "Empty Title"
+    params = {'query.bibliographic': title, 'rows': 2}
+    if author: params['query.author'] = author
+    data, status = _call_external_api_with_retry("https://api.crossref.org/works", params)
+    
+    if status == "OK" and data and data.get('message', {}).get('items'):
+        for item in data['message']['items']:
+            res_title = item.get('title', [''])[0]
+            res_authors = item.get('author', [])
+            if _is_match(title, res_title):
+                if _check_author_match(author, res_authors):
+                    return item.get('URL') or f"https://doi.org/{item.get('DOI')}", "OK"
+                else: continue
+        return None, "Match failed"
+    return None, status
+
+def search_scopus_by_title(title, api_key, author=None):
+    if not api_key: return None, "No API Key"
+    url = "https://api.elsevier.com/content/search/scopus"
+    headers = {"Accept": "application/json", "X-ELS-APIKey": api_key}
+    params = {"query": f'TITLE("{title}")', "count": 1}
+    data, status = _call_external_api_with_retry(url, params, headers)
+    if status == "OK" and data:
+        entries = data.get('search-results', {}).get('entry', [])
+        if not entries or 'error' in entries[0]: return None, "(No results)"
+        match = entries[0]
+        res_title = match.get('dc:title', '')
+        res_creator = match.get('dc:creator', '')
+        if _is_match(title, res_title):
+            if _check_author_match(author, [res_creator]):
+                return match.get('prism:url', 'https://www.scopus.com'), "OK"
+            else: return None, "Author Mismatch"
+        else: return None, "Title Mismatch"
+    return None, "Error"
+
+def search_scholar_by_title(title, api_key, author=None, raw_text=None):
+    if not api_key or not GoogleSearch: return None, "No API Key or SerpLib"
+    
+    def _do_search(query_string, match_mode, required_author=None):
+        try:
+            params = {"engine": "google_scholar", "q": query_string, "api_key": api_key, "num": 10}
+            results = GoogleSearch(params).get_dict()
+            organic = results.get("organic_results", [])
+            for res in organic:
+                res_title = res.get("title", "")
+                if _is_match(title, res_title):
+                    if required_author:
+                        pub_info = res.get("publication_info", {})
+                        summary = pub_info.get("summary", "")
+                        extracted = summary.split(" - ")[0] if " - " in summary else summary
+                        if not _check_author_match(required_author, [a.strip() for a in extracted.split(",")]):
+                            continue
+                    found_link = res.get("link")
+                    if found_link: return found_link, match_mode
+                    else: return "Citation Record (No Direct Link)", match_mode + " [Citation Only]"
+            return None, None
+        except Exception as e: return None, f"Error: {e}"
+
+    valid_author = None
+    if author:
+        cleaned = re.sub(r'(?i)[\(\[]?\bet\.?\s*al\.?[\)\]]?', '', author).strip().strip(' .,;()[]')
+        if len(cleaned) > 1: valid_author = cleaned
+
+    if valid_author:
+        link, status = _do_search(f'{title} {valid_author}', "match (Title+Author)")
+        if link: return link, status
+
+    link, status = _do_search(title, "match (Title Only)", required_author=valid_author)
+    if link: return link, status
+    
+    if raw_text and len(raw_text) > 10:
+        link, status = _do_search(raw_text, "match (Raw Text Fallback)", required_author=valid_author)
+        if link: return link, status
+
+    return None, "No match found"
+
+def search_scholar_by_ref_text(ref_text, api_key, target_title=None):
+    if not api_key or not GoogleSearch: return None, "No API Key"
+    params = {"engine": "google_scholar", "q": ref_text, "api_key": api_key, "num": 1}
+    try:
+        results = GoogleSearch(params).get_dict()
+        organic = results.get("organic_results", [])
+        if organic:
+            res_title = organic[0].get("title", "")
+            if target_title and not _is_match(target_title, res_title):
+                return None, "Title mismatch"
+            return organic[0].get("link"), "similar"
+    except: pass
+    return None, "No results"
+
+def check_url_availability(url):
+    if not url or not url.startswith("http"): return False
+    if url.count('/') < 3: return False
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    try:
+        resp = requests.head(url, timeout=5, allow_redirects=True, verify=False)
+        return 200 <= resp.status_code < 400
+    except: return False
+
+# ==============================================================================
+# 5. 主程式核心邏輯 (check_single_task)
+# ==============================================================================
+
+def format_name_field(data):
+    # 簡單格式化
+    if not data: return None
+    if isinstance(data, list): return "; ".join(map(str, data))
+    return str(data)
 
 def refine_parsed_data(parsed_item):
     item = parsed_item.copy()
     raw_text = item.get('text', '').strip()
-
-    # 如果沒有 URL，嘗試從文字中抓取
+    
     if not item.get('url'):
         url_match = re.search(r'(https?://[^\s]+)', raw_text)
-        if url_match:
-            item['url'] = url_match.group(1).strip(' .')
+        if url_match: item['url'] = url_match.group(1).strip(' .')
 
     for key in ['doi', 'url', 'title', 'date']:
         if item.get(key) and isinstance(item[key], str):
             item[key] = item[key].strip(' ,.;)]}>')
 
     title = item.get('title', '')
-
-    # 修正 title 開頭為 "&" 或 "and" 的情況
-    if title and (title.startswith('&') or title.lower().startswith('and ')):
-        fix_match = re.search(
-            r'^&(?:amp;)?\s*[^0-9]+?\(?\d{4}\)?[\.\s]+(.*)',
-            title
-        )
-        if fix_match:
-            cleaned_title = fix_match.group(1).strip()
-            if len(cleaned_title) > 5:
-                title = cleaned_title
-                item['title'] = title
-
     if title:
         title = re.sub(r'^\s*\d{4}[\.\s]+', '', title)
         title = re.sub(r'(?i)\.?\s*arXiv.*$', '', title)
-        title = re.sub(r'(?i)\.?\s*Available.*$', '', title)
         item['title'] = title
-
-    # 如果 title 太短或遺失，嘗試使用其他欄位 fallback
-    if not title or len(title) < 5:
-        abbr_match = re.search(
-            r'^([A-Z0-9\-\.\s]{2,12}:\s*.+?)(?=\s*[,\[]|\s*Available|\s*\(|\bhttps?://|\.|$)',
-            raw_text
-        )
-        if abbr_match:
-            item['title'] = abbr_match.group(1).strip()
-        else:
-            for backup_key in ['publisher', 'container-title', 'journal']:
-                val = item.get(backup_key)
-                if val and len(str(val)) > 15:
-                    item['title'] = str(val).strip()
-                    break
-
-        if (not item.get('title') or item['title'] == 'N/A') and item.get('date'):
-            year_str = str(item['date'])[0:4]
-            if year_str.isdigit():
-                fallback_match = re.search(rf'{year_str}\W+\s*(.+)', raw_text)
-                if fallback_match:
-                    candidate = fallback_match.group(1).strip()
-                    candidate = re.sub(r'(?i)\.?\s*arXiv.*$', '', candidate)
-                    candidate = re.sub(r'(?i)\.?\s*Available.*$', '', candidate)
-                    if len(candidate) > 5:
-                        item['title'] = candidate.strip(' .')
-
-    url_val = item.get('url', '')
-    if url_val:
-        doi_match = re.search(
-            r'(10\.\d{4,9}/[-._;()/:a-zA-Z0-9]+)',
-            url_val
-        )
-        if doi_match:
-            item['doi'] = doi_match.group(1).strip('.')
-
-    if item.get('authors'):
-        item['authors'] = format_name_field(item['authors'])
-    if item.get('editor'):
-        item['editor'] = format_name_field(item['editor'])
-
+        
     return item
 
 def check_single_task(idx, raw_ref, local_df, target_col, scopus_key, serpapi_key):
@@ -208,10 +486,10 @@ def check_single_task(idx, raw_ref, local_df, target_col, scopus_key, serpapi_ke
     title, text = ref.get('title', ''), ref.get('text', '')
     search_query = title if (title and len(title) > 8) else text[:120]
     doi, parsed_url = ref.get('doi'), ref.get('url')
-    first_author = (
-        ref['authors'].split(';')[0].split(',')[0].strip()
-        if ref.get('authors') else ""
-    )
+    
+    # 提取第一作者
+    authors_str = ref.get('authors', '')
+    first_author = authors_str.split(';')[0].split(',')[0].strip() if authors_str else ""
 
     res = {
         "id": idx,
@@ -223,344 +501,127 @@ def check_single_task(idx, raw_ref, local_df, target_col, scopus_key, serpapi_ke
         "suggestion": None
     }
 
-    # 0. Local Database Check
+    # 0. Local Database
     if bool(re.search(r'[\u4e00-\u9fff]', search_query)) and local_df is not None and title:
-        match_row, _ = search_local_database(
-            local_df, target_col, title, threshold=0.85
-        )
+        match_row, _ = search_local_database(local_df, target_col, title, threshold=0.85)
         if match_row is not None:
-            res.update({
-                "sources": {"Local DB": "Matched"},
-                "found_at_step": "0. Local Database"
-            })
+            res.update({"sources": {"Local DB": "Matched"}, "found_at_step": "0. Local Database"})
             return res
 
-    # 1. DOI Check
+    # 1. DOI / Crossref
     if doi:
-        _, url, _ = search_crossref_by_doi(
-            doi, target_title=title if title else None
-        )
+        _, url, _ = search_crossref_by_doi(doi, target_title=title if title else None)
         if url:
-            res.update({
-                "sources": {"Crossref": url},
-                "found_at_step": "1. Crossref (DOI)"
-            })
+            res.update({"sources": {"Crossref": url}, "found_at_step": "1. Crossref (DOI)"})
             return res
 
-    # 1. Crossref Search
     url, _ = search_crossref_by_text(search_query, first_author)
     if url:
-        res.update({
-            "sources": {"Crossref": url},
-            "found_at_step": "1. Crossref (Search)"
-        })
+        res.update({"sources": {"Crossref": url}, "found_at_step": "1. Crossref (Search)"})
         return res
 
     # 2. Scopus
     if scopus_key:
-        url, _ = search_scopus_by_title(
-            search_query, scopus_key, author=first_author
-        )
+        url, _ = search_scopus_by_title(search_query, scopus_key, author=first_author)
         if url:
-            res.update({
-                "sources": {"Scopus": url},
-                "found_at_step": "2. Scopus"
-            })
+            res.update({"sources": {"Scopus": url}, "found_at_step": "2. Scopus"})
             return res
 
     # 5. Google Scholar
-    for api_func, step_name in [
-        (lambda: search_scholar_by_title(
-            search_query,
-            serpapi_key,
-            author=first_author,
-            raw_text=raw_ref['text']
-        ), "5. Google Scholar")
-    ]:
-        try:
-            url, _ = api_func()
-            if url:
-                res.update({
-                    "sources": {step_name.split(". ")[1]: url},
-                    "found_at_step": step_name
-                })
-                return res
-        except:
-            pass
-
-    # SerpAPI fallback suggestion
     if serpapi_key:
-        url_r, _ = search_scholar_by_ref_text(
-            text, serpapi_key, target_title=title
-        )
-        if url_r:
-            res["suggestion"] = url_r
+        url, step_name = search_scholar_by_title(search_query, serpapi_key, author=first_author, raw_text=text)
+        if url:
+            res.update({"sources": {"Scholar": url}, "found_at_step": f"5. Google Scholar ({step_name})"})
+            return res
+
+        # Fallback suggestion
+        url_r, _ = search_scholar_by_ref_text(text, serpapi_key, target_title=title)
+        if url_r: res["suggestion"] = url_r
 
     # 6. Direct Link Check
     if parsed_url and parsed_url.startswith('http'):
         if check_url_availability(parsed_url):
-            res.update({
-                "sources": {"Direct Link": parsed_url},
-                "found_at_step": "6. Website / Direct URL"
-            })
+            res.update({"sources": {"Direct Link": parsed_url}, "found_at_step": "6. Website"})
         else:
-            res.update({
-                "sources": {"Direct Link (Dead)": parsed_url},
-                "found_at_step": "6. Website (Link Failed)"
-            })
+            res.update({"sources": {"Direct Link (Dead)": parsed_url}, "found_at_step": "6. Website (Failed)"})
 
     return res
 
-# ========== Sidebar ==========
+# ==============================================================================
+# 6. UI 主程式
+# ==============================================================================
+
+# Sidebar
 with st.sidebar:
     st.header("⚙️ System Settings")
+    
+    # 環境診斷
+    if shutil.which("anystyle"):
+        st.success("✅ AnyStyle Ready")
+    else:
+        st.error("❌ AnyStyle Missing")
+        st.info("請確認 packages.txt 已包含 ruby-full 並重啟 APP")
+
     DEFAULT_CSV_PATH = "112ndltd.csv"
     local_df, target_col = None, None
-
     if os.path.exists(DEFAULT_CSV_PATH):
         local_df = load_csv_data(DEFAULT_CSV_PATH)
         if local_df is not None:
-            st.success(f"✅ Local database loaded: {len(local_df)} records")
-            target_col = (
-                "論文名稱" if "論文名稱" in local_df.columns
-                else local_df.columns[0]
-            )
+            st.success(f"Local DB: {len(local_df)} records")
+            target_col = "論文名稱" if "論文名稱" in local_df.columns else local_df.columns[0]
 
     scopus_key = get_scopus_key()
     serpapi_key = get_serpapi_key()
-    st.divider()
-    st.caption("API Status:")
-    st.write(
-        f"Scopus: {'✅' if scopus_key else '❌'} | "
-        f"SerpAPI: {'✅' if serpapi_key else '❌'}"
-    )
+    st.write(f"Scopus: {'✅' if scopus_key else '❌'} | SerpAPI: {'✅' if serpapi_key else '❌'}")
 
-# ========== Main Page ==========
-st.markdown(
-    '<div class="main-header">📚 Automated Citation Verification Report</div>',
-    unsafe_allow_html=True
-)
-st.markdown(
-    '<div class="sub-header">'
-    'Integrated academic databases with one-click verification and CSV export'
-    '</div>',
-    unsafe_allow_html=True
-)
+# Main
+st.markdown('<h1 style="text-align:center; color:#4F46E5;">📚 自動化文獻驗證系統</h1>', unsafe_allow_html=True)
+st.markdown('<p style="text-align:center;">整合 AnyStyle 解析與多重資料庫 (Crossref, Scopus, Google Scholar) 驗證</p>', unsafe_allow_html=True)
 
-# Step 1: Input
-st.markdown("### 📥 Step 1: Paste Reference List")
-raw_input = st.text_area(
-    "Paste your references here:",
-    height=250,
-    placeholder=(
-        "Example:\n"
-        "StyleTTS 2: Towards Human-Level Text-to-Speech...\n"
-        "AIOS: LLM Agent Operating System..."
-    )
-)
+raw_input = st.text_area("請貼上參考文獻列表 (Paste References):", height=200, placeholder="例如: StyleTTS 2: Towards Human-Level Text-to-Speech...")
 
-# Step 2: Run
-if st.button(
-    "🚀 Run Automatic Verification & Generate Report",
-    type="primary",
-    use_container_width=True
-):
+if st.button("🚀 開始驗證", type="primary", use_container_width=True):
     if not raw_input:
-        st.warning("⚠️ Please paste references before running.")
+        st.warning("⚠️ 請輸入內容")
     else:
         st.session_state.results = []
-        with st.status(
-            "🔍 Running verification process...",
-            expanded=True
-        ) as status:
-            status.write("Parsing references...")
+        with st.status("🔍 執行中...", expanded=True) as status:
+            status.write("正在解析格式 (AnyStyle)...")
             _, struct_list = parse_references_with_anystyle(raw_input)
-
+            
             if struct_list:
-                status.write(
-                    f"Querying academic databases "
-                    f"({len(struct_list)} references)..."
-                )
+                status.write(f"解析成功 ({len(struct_list)} 筆)，開始查詢資料庫...")
                 progress_bar = st.progress(0)
                 results_buffer = []
 
-                with ThreadPoolExecutor(max_workers=20) as executor:
+                with ThreadPoolExecutor(max_workers=5) as executor:
                     futures = {
                         executor.submit(
-                            check_single_task,
-                            i + 1,
-                            r,
-                            local_df,
-                            target_col,
-                            scopus_key,
-                            serpapi_key
-                        ): i
-                        for i, r in enumerate(struct_list)
+                            check_single_task, i+1, r, local_df, target_col, scopus_key, serpapi_key
+                        ): i for i, r in enumerate(struct_list)
                     }
                     for i, future in enumerate(as_completed(futures)):
                         results_buffer.append(future.result())
-                        progress_bar.progress(
-                            (i + 1) / len(struct_list)
-                        )
+                        progress_bar.progress((i + 1) / len(struct_list))
 
-                st.session_state.results = sorted(
-                    results_buffer,
-                    key=lambda x: x['id']
-                )
-                status.update(
-                    label="✅ Verification completed!",
-                    state="complete",
-                    expanded=False
-                )
+                st.session_state.results = sorted(results_buffer, key=lambda x: x['id'])
+                status.update(label="✅ 驗證完成！", state="complete", expanded=False)
             else:
-                st.error(
-                    "❌ AnyStyle parsing failed. "
-                    "Please check your input."
-                )
+                status.update(label="❌ 解析失敗", state="error")
+                st.error("AnyStyle 解析失敗，請檢查輸入格式或系統環境。")
 
-# Step 3: Results & Download
-if st.session_state.results:
+# 結果顯示
+if "results" in st.session_state and st.session_state.results:
     st.divider()
-    st.markdown("### 📊 Step 2: Verification Results & Download")
+    
+    total = len(st.session_state.results)
+    verified = sum(1 for r in st.session_state.results if r.get('found_at_step') and "6." not in r.get('found_at_step'))
+    
+    c1, c2, c3 = st.columns(3)
+    c1.metric("總筆數", total)
+    c2.metric("資料庫驗證成功", verified)
+    c3.metric("需人工確認", total - verified)
 
-    total_refs = len(st.session_state.results)
-    verified_db = sum(
-        1 for r in st.session_state.results
-        if r.get('found_at_step') and "6." not in r.get('found_at_step')
-    )
-    failed_refs = total_refs - verified_db
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total References", total_refs)
-    col2.metric("Verified via Databases", verified_db)
-    col3.metric(
-        "Require Manual Review",
-        failed_refs,
-        delta_color="inverse"
-    )
-
+    # 下載 CSV
     df_export = pd.DataFrame([{
         "ID": r['id'],
-        "Status": (
-            r['found_at_step']
-            if r['found_at_step']
-            else "Not Found"
-        ),
-        "Detected Title": r['title'],
-        "Original Reference Text": r['text'],
-        "Verified Source Link": (
-            next(iter(r['sources'].values()), "N/A")
-            if r['sources'] else "N/A"
-        )
-    } for r in st.session_state.results])
-
-    csv_data = df_export.to_csv(
-        index=False
-    ).encode('utf-8-sig')
-
-    st.download_button(
-        label="📥 Download Full Verification Report (CSV)",
-        data=csv_data,
-        file_name=(
-            f"Citation_Check_{time.strftime('%Y%m%d_%H%M')}.csv"
-        ),
-        mime="text/csv",
-        use_container_width=True
-    )
-
-    # Step 4: Detailed List with Filters
-    st.markdown("---")
-    st.markdown("#### 🔍 Detailed Verification List")
-
-    filter_option = st.radio(
-        "Filter results:",
-        [
-            "Show All",
-            "✅ Verified (Database)",
-            "🌐 Valid Website Source",
-            "⚠️ Website (Connection Failed)",
-            "❌ Not Found"
-        ],
-        horizontal=True
-    )
-
-    filtered_results = []
-    for r in st.session_state.results:
-        raw_step = r.get('found_at_step')
-        step = str(raw_step) if raw_step is not None else ""
-
-        if filter_option == "Show All":
-            filtered_results.append(r)
-        elif (
-            filter_option == "✅ Verified (Database)"
-            and step and "6." not in step and "Failed" not in step
-        ):
-            filtered_results.append(r)
-        elif (
-            filter_option == "🌐 Valid Website Source"
-            and "6." in step and "Failed" not in step
-        ):
-            filtered_results.append(r)
-        elif (
-            filter_option == "⚠️ Website (Connection Failed)"
-            and "Failed" in step
-        ):
-            filtered_results.append(r)
-        elif (
-            filter_option == "❌ Not Found"
-            and (not step or step == "")
-        ):
-            filtered_results.append(r)
-
-    if not filtered_results:
-        st.info(
-            f"No items match the filter: "
-            f"'{filter_option}'."
-        )
-    else:
-        for item in filtered_results:
-            raw_step = item.get('found_at_step')
-            step = str(raw_step) if raw_step is not None else ""
-
-            if not step:
-                status_icon = "❌"
-            elif "Failed" in step:
-                status_icon = "⚠️"
-            elif "6." in step:
-                status_icon = "🌐"
-            else:
-                status_icon = "✅"
-
-            with st.expander(
-                f"{status_icon} ID {item['id']}: "
-                f"{item['text'][:80]}..."
-            ):
-                st.markdown(
-                    f"**Verification Result:** "
-                    f"`{step if step else 'No Match Found'}`"
-                )
-                st.markdown("**Original Reference:**")
-                st.markdown(
-                    f"<div class='ref-box'>{item['text']}</div>",
-                    unsafe_allow_html=True
-                )
-
-                if item.get('sources'):
-                    st.markdown("**Source Links:**")
-                    for src, link in item['sources'].items():
-                        st.write(f"- {src}: {link}")
-
-                if (
-                    (not step or "Failed" in step)
-                    and item.get("suggestion")
-                ):
-                    st.warning(
-                        "💡 Suggested similar reference "
-                        f"[Click to review manually]"
-                        f"({item['suggestion']})"
-                    )
-else:
-    st.info(
-        "💡 No results yet. "
-        "Paste references above and click the button to start."
-    )
