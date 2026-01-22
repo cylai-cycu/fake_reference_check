@@ -7,23 +7,74 @@ import os
 import re
 import ast
 import difflib
+import subprocess
+import shutil
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Custom modules
-from modules.parsers import parse_references_with_anystyle
-from modules.local_db import load_csv_data, search_local_database
-from modules.api_clients import (
-    get_scopus_key,
-    get_serpapi_key,
-    search_crossref_by_doi,
-    search_crossref_by_text,
-    search_scopus_by_title,
-    search_scholar_by_title,
-    search_scholar_by_ref_text,
-    search_s2_by_title,
-    search_openalex_by_title,
-    check_url_availability
-)
+# === 自動安裝與設定 AnyStyle (針對雲端環境修正版) ===
+def install_and_setup_anystyle():
+    print("🔄 開始檢查 AnyStyle 環境...")
+    
+    # 1. 嘗試安裝 (如果尚未安裝)
+    if shutil.which("anystyle") is None:
+        print("⚠️ 尚未偵測到 anystyle，嘗試透過 gem 安裝...")
+        try:
+            # 使用 user install 模式以避免權限問題 (針對某些雲端環境)
+            # 但先嘗試全域安裝，若失敗再試 user install
+            try:
+                subprocess.run(["gem", "install", "anystyle-cli"], check=True)
+            except subprocess.CalledProcessError:
+                subprocess.run(["gem", "install", "--user-install", "anystyle-cli"], check=True)
+            print("✅ Gem 安裝指令執行完畢")
+        except Exception as e:
+            print(f"❌ 安裝失敗: {e}")
+
+    # 2. 關鍵步驟：強制將 Gem 的 bin 目錄加入 PATH
+    # 很多時候安裝成功了，但執行檔在 ~/.local/share/gem/... 裡面，系統找不到
+    try:
+        # 詢問 gem 執行檔路徑在哪
+        result = subprocess.run(["gem", "environment", "bin"], capture_output=True, text=True)
+        if result.returncode == 0:
+            gem_bin_path = result.stdout.strip()
+            
+            # 檢查這個路徑是否已經在 PATH 裡
+            current_path = os.environ.get("PATH", "")
+            if gem_bin_path not in current_path:
+                print(f"🔧 將 Gem 路徑加入系統 PATH: {gem_bin_path}")
+                os.environ["PATH"] += os.pathsep + gem_bin_path
+            else:
+                print(f"✅ Gem 路徑已在 PATH 中: {gem_bin_path}")
+                
+        # 再次確認是否找得到
+        final_check = shutil.which("anystyle")
+        if final_check:
+            print(f"🎉 成功偵測到 anystyle: {final_check}")
+        else:
+            print("❌ 警告：即使設定了路徑，仍然找不到 anystyle。")
+            
+    except Exception as e:
+        print(f"❌ 路徑設定發生錯誤: {e}")
+
+# 在匯入其他模組前，先執行環境設定
+install_and_setup_anystyle()
+
+# === 以下維持原有的模組匯入與程式邏輯 ===
+try:
+    from modules.parsers import parse_references_with_anystyle
+#from modules.local_db import load_csv_data, search_local_database
+#from modules.api_clients import (
+#    get_scopus_key,
+#    get_serpapi_key,
+#    search_crossref_by_doi,
+#    search_crossref_by_text,
+#    search_scopus_by_title,
+#    search_scholar_by_title,
+#    search_scholar_by_ref_text,
+#    search_s2_by_title,
+#    search_openalex_by_title,
+#    check_url_availability
+#)
 
 # ========== Page Config & Style ==========
 st.set_page_config(
