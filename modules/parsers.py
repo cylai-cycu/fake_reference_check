@@ -11,8 +11,7 @@ import os
 # AnyStyle 解析（語系自動偵測逐行模型切換版）
 # ==============================================================================
 
-# 🔴 請確保此路徑與你電腦中的 ruby.exe 位置一致
-RUBY_EXE = r"C:\Ruby34\bin\ruby.exe"
+# 🗑️ [已移除] 舊的 RUBY_EXE 路徑設定，雲端環境不需要
 
 def parse_references_with_anystyle(raw_text_for_anystyle):
     """
@@ -23,10 +22,7 @@ def parse_references_with_anystyle(raw_text_for_anystyle):
     if not raw_text_for_anystyle or not raw_text_for_anystyle.strip():
         return [], []
 
-    # 1️⃣ 確認 ruby.exe 存在
-    if not os.path.exists(RUBY_EXE):
-        st.error(f"❌ 找不到 ruby.exe：{RUBY_EXE}")
-        return [], []
+    # 🗑️ [已移除] 檢查 ruby.exe 是否存在的區塊，雲端環境不需要
 
     # 2️⃣ 將輸入文字按行拆分，過濾掉空行
     lines = [line.strip() for line in raw_text_for_anystyle.split('\n') if line.strip()]
@@ -57,20 +53,16 @@ def parse_references_with_anystyle(raw_text_for_anystyle):
             continue
 
         # 5️⃣ 組合指令：根據單行內容動態切換模型
-        command = [
-            RUBY_EXE,
-            "-S",
-            "anystyle",
-            "-f", "json",
-            "parse"
-        ]
+        # 🛠️ [修改重點] 直接呼叫 anystyle，不再透過指定路徑的 ruby.exe
+        command = ["anystyle"]
 
         if has_chinese:
             # 偵測到中文：插入自定義模型參數
-            command.insert(3, "-P")
-            command.insert(4, "custom.mod")
+            # 注意：custom.mod 必須與 app.py 位於同一工作目錄下
+            command.extend(["-P", "custom.mod"])
         
-        command.append(tmp_path)
+        # 加入其他參數：格式為 JSON，動作為 parse，最後接檔案路徑
+        command.extend(["-f", "json", "parse", tmp_path])
 
         try:
             process = subprocess.run(
@@ -90,7 +82,7 @@ def parse_references_with_anystyle(raw_text_for_anystyle):
                     stdout = match.group(0)
 
             line_data = json.loads(stdout)
-            print(line_data)
+            # print(line_data) # debug 用，可註解掉
 
             for item in line_data:
                 cleaned_item = {}
@@ -122,6 +114,10 @@ def parse_references_with_anystyle(raw_text_for_anystyle):
         except Exception as e:
             # 發生錯誤時記錄該行但繼續執行
             st.error(f"解析第 {i+1} 行時發生錯誤：{e}")
+            # 如果是找不到指令的錯誤，提示使用者
+            if isinstance(e, FileNotFoundError):
+                st.error("💡 提示：系統找不到 `anystyle` 指令。請確認是否已透過 Dockerfile 或 packages.txt 安裝 ruby 與 anystyle-cli。")
+                
         finally:
             # 刪除暫存檔
             try:
@@ -136,7 +132,7 @@ def parse_references_with_anystyle(raw_text_for_anystyle):
 
 
 # ==============================================================================
-# 標題清洗函式
+# 標題清洗函式 (保持原樣)
 # ==============================================================================
 
 def clean_title(text):
