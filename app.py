@@ -110,6 +110,57 @@ def clean_title(text):
     cleaned = [ch.lower() for ch in text if unicodedata.category(ch)[0] in ("L", "N", "Z")]
     return re.sub(r"\s+", " ", "".join(cleaned)).strip()
 
+def basic_python_parser(text):
+    """
+    當 AnyStyle 掛掉時的救援解析器 (使用 Regex 抓取基本欄位)
+    針對標準 APA 格式優化：Author (Year). Title. Journal...
+    """
+    item = {"text": text, "title": "", "authors": "", "date": "", "url": ""}
+    
+    try:
+        # 1. 抓取年份 (YYYY)
+        year_match = re.search(r'\((\d{4})\)\.?', text)
+        if year_match:
+            item["date"] = year_match.group(1)
+            # 年份前面通常是作者
+            authors_part = text[:year_match.start()].strip()
+            item["authors"] = authors_part.strip(' .,&')
+            
+            # 年份後面通常是標題 + 期刊
+            rest_part = text[year_match.end():].strip()
+            
+            # 嘗試抓取標題 (假設標題以句號結尾)
+            # 排除 "In press", "Vol." 等干擾
+            title_match = re.search(r'^(.+?)(?=\.\s|$)', rest_part)
+            if title_match:
+                item["title"] = title_match.group(1).strip()
+            else:
+                item["title"] = rest_part[:100] # 抓不到就先切前100字
+        else:
+            # 沒年份，嘗試硬抓標題 (抓第一個句號前的內容)
+            title_match = re.search(r'^(.+?)(?=\.\s|$)', text)
+            if title_match:
+                item["title"] = title_match.group(1).strip()
+                
+        # 抓網址 (DOI 或 http)
+        url_match = re.search(r'(https?://[^\s]+|10\.\d{4,9}/[-._;()/:a-zA-Z0-9]+)', text)
+        if url_match:
+            found_url = url_match.group(1)
+            if found_url.startswith("10."):
+                item["doi"] = found_url
+                item["url"] = f"https://doi.org/{found_url}"
+            else:
+                item["url"] = found_url.strip('.')
+                
+    except Exception:
+        pass # 救援失敗就算了
+        
+    # 保底：如果標題還是空的，就用原句的前50字當標題
+    if not item["title"] or len(item["title"]) < 5:
+        item["title"] = text[:50] + "..."
+        
+    return item
+
 def parse_references_with_anystyle(raw_text):
     if not raw_text or not raw_text.strip():
         return [], []
@@ -117,22 +168,21 @@ def parse_references_with_anystyle(raw_text):
     lines = [line.strip() for line in raw_text.split('\n') if line.strip()]
     structured_refs = []
     
-    # 這裡假設 custom.mod 在同一目錄下，如果沒有就忽略
     use_custom_model = os.path.exists("custom.mod")
-
-    # 建立 UI 進度條
     progress_bar = st.progress(0)
     
     for i, line in enumerate(lines):
-        has_chinese = bool(re.search(r'[\u4e00-\u9fff]', line))
-        
-        cmd = [ANYSTYLE_CMD]
-        if has_chinese and use_custom_model:
-            cmd.extend(["-P", "custom.mod"])
-        cmd.extend(["-f", "json", "parse"])
-        
+        # -------------------------------------------------
+        # 策略 A: 優先嘗試 AnyStyle (Ruby)
+        # -------------------------------------------------
         try:
-            # 使用 stdin 傳入資料 (比寫檔快且穩)
+            has_chinese = bool(re.search(r'[\u4e00-\u9fff]', line))
+            cmd = [ANYSTYLE_CMD]
+            if has_chinese and use_custom_model:
+                cmd.extend(["-P", "custom.mod"])
+            cmd.extend(["-f", "json", "parse"])
+            
+            # 執行指令
             process = subprocess.run(
                 cmd,
                 input=line,
@@ -142,19 +192,18 @@ def parse_references_with_anystyle(raw_text):
                 check=True
             )
             
+            # 解析輸出
             output = process.stdout.strip()
-            # 擷取 JSON
             if not output.startswith("["):
                  match = re.search(r"\[.*\]", output, re.DOTALL)
                  if match: output = match.group(0)
             
-            data = ast.literal_eval(output) # 或 json.loads
+            data = ast.literal_eval(output)
             
             for item in data:
-                # 簡易資料清洗
+                # 簡單資料清洗
                 for k, v in item.items():
                     if isinstance(v, list):
-                        # author 欄位特殊處理
                         if k == 'author':
                             authors = []
                             for a in v:
@@ -168,14 +217,21 @@ def parse_references_with_anystyle(raw_text):
                             item[k] = "; ".join([str(x) for x in v])
 
                 item["text"] = line
-                # 確保有 title
                 if "title" not in item: item["title"] = "N/A"
-                
                 structured_refs.append(item)
-                
+
+        # -------------------------------------------------
+        # 策略 B: 救援模式 (Python Fallback)
+        # -------------------------------------------------
         except Exception as e:
-            # 失敗時保留原始文字
-            structured_refs.append({"text": line, "title": "Parse Error", "error": str(e)})
+            # 這裡不顯示錯誤，而是直接切換到 Python 解析
+            print(f"⚠️ AnyStyle failed for line {i}, switching to Python parser. Error: {e}")
+            
+            fallback_item = basic_python_parser(line)
+            # 在物件中標記它是用救援模式抓的 (可選)
+            fallback_item["note"] = "Parsed via Python (Fallback)"
+            
+            structured_refs.append(fallback_item)
 
         progress_bar.progress((i + 1) / len(lines))
 
