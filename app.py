@@ -648,38 +648,53 @@ if st.button("🚀 開始驗證", type="primary", use_container_width=True):
 if "results" in st.session_state and st.session_state.results:
     st.divider()
     
+    # 計算統計數據
     total = len(st.session_state.results)
     verified = sum(1 for r in st.session_state.results if r.get('found_at_step') and "6." not in r.get('found_at_step'))
     
+    # 顯示 Metrics
     c1, c2, c3 = st.columns(3)
     c1.metric("總筆數", total)
     c2.metric("資料庫驗證成功", verified)
     c3.metric("需人工確認", total - verified)
 
-# 下載 CSV
+    # 準備下載用的 DataFrame
     df_export = pd.DataFrame([{
         "ID": r['id'],
         "Status": r['found_at_step'] or "Not Found",
         "Title": r['title'],
         "Source": next(iter(r['sources'].values()), "N/A") if r['sources'] else "N/A",
-        "Original": r['text']
+        "Original": r['text'],
+        "Error_Log": r.get('error', '') # 加入錯誤紀錄欄位
     } for r in st.session_state.results])
     
-    st.download_button("📥 下載報告 (CSV)", df_export.to_csv(index=False).encode('utf-8-sig'), "report.csv", "text/csv")
+    # 下載按鈕
+    csv_data = df_export.to_csv(index=False).encode('utf-8-sig')
+    st.download_button(
+        label="📥 下載報告 (CSV)",
+        data=csv_data,
+        file_name="verification_report.csv",
+        mime="text/csv"
+    )
 
-    # 詳細列表
-st.markdown("### 📝 詳細結果")
+    # 詳細列表顯示
+    st.markdown("### 📝 詳細結果")
     for item in st.session_state.results:
         step = item.get('found_at_step', '')
-        # 如果是 Parse Error，顯示紅色警示
-        icon = "❌" if "Parse Error" in item['title'] or (step and "Failed" in step) or not step else "✅"
         
+        # 判斷狀態圖示：有 Parse Error 或狀態含 Failed 都算失敗
+        if item.get('error') or "Parse Error" in item.get('title', '') or (step and "Failed" in step) or not step:
+            icon = "❌"
+        else:
+            icon = "✅"
+            
         with st.expander(f"{icon} [{item['id']}] {item['title']}"):
-            # 1. 如果有錯誤訊息，優先顯示 (這是除錯的關鍵！)
+            # 優先顯示錯誤訊息 (除錯關鍵)
             if item.get('error'):
-                st.error(f"🔧 系統錯誤訊息: {item['error']}")
-                st.info("💡 提示: 如果是 'No such file'，請確認 packages.txt 是否存在並已 Reboot App。")
-
+                st.error(f"🔧 系統錯誤: {item['error']}")
+                if "No such file" in str(item['error']):
+                    st.info("💡 提示: 請確認 GitHub 根目錄有 packages.txt 且已執行 Reboot App。")
+            
             st.write(f"**狀態**: {step or '未找到'}")
             st.write(f"**原始文字**: {item['text']}")
             
