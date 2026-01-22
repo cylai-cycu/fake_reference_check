@@ -12,71 +12,77 @@ import shutil
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# === 自動安裝與設定 AnyStyle (針對雲端環境修正版) ===
+# ==============================================================================
+# 1. 自動安裝與設定 AnyStyle (針對雲端環境修正)
+# ==============================================================================
 def install_and_setup_anystyle():
+    # 避免在 Streamlit 重跑 script 時重複執行輸出，雖非必須但可讓 log 乾淨點
+    if "anystyle_setup_done" in st.session_state:
+        return
+
     print("🔄 開始檢查 AnyStyle 環境...")
     
-    # 1. 嘗試安裝 (如果尚未安裝)
+    # (A) 嘗試安裝 (如果尚未安裝)
     if shutil.which("anystyle") is None:
         print("⚠️ 尚未偵測到 anystyle，嘗試透過 gem 安裝...")
         try:
-            # 使用 user install 模式以避免權限問題 (針對某些雲端環境)
-            # 但先嘗試全域安裝，若失敗再試 user install
+            # 先嘗試全域安裝
+            subprocess.run(["gem", "install", "anystyle-cli"], check=True)
+            print("✅ Gem 全域安裝成功")
+        except subprocess.CalledProcessError:
             try:
-                subprocess.run(["gem", "install", "anystyle-cli"], check=True)
-            except subprocess.CalledProcessError:
+                # 若失敗則嘗試 user install
                 subprocess.run(["gem", "install", "--user-install", "anystyle-cli"], check=True)
-            print("✅ Gem 安裝指令執行完畢")
-        except Exception as e:
-            print(f"❌ 安裝失敗: {e}")
+                print("✅ Gem 使用者安裝成功")
+            except Exception as e:
+                print(f"❌ 安裝失敗: {e}")
 
-    # 2. 關鍵步驟：強制將 Gem 的 bin 目錄加入 PATH
-    # 很多時候安裝成功了，但執行檔在 ~/.local/share/gem/... 裡面，系統找不到
+    # (B) 強制將 Gem 的 bin 目錄加入 PATH
+    # 這是最關鍵的一步，解決找不到指令的問題
     try:
-        # 詢問 gem 執行檔路徑在哪
         result = subprocess.run(["gem", "environment", "bin"], capture_output=True, text=True)
         if result.returncode == 0:
             gem_bin_path = result.stdout.strip()
-            
-            # 檢查這個路徑是否已經在 PATH 裡
             current_path = os.environ.get("PATH", "")
+            
             if gem_bin_path not in current_path:
                 print(f"🔧 將 Gem 路徑加入系統 PATH: {gem_bin_path}")
                 os.environ["PATH"] += os.pathsep + gem_bin_path
-            else:
-                print(f"✅ Gem 路徑已在 PATH 中: {gem_bin_path}")
-                
-        # 再次確認是否找得到
-        final_check = shutil.which("anystyle")
-        if final_check:
-            print(f"🎉 成功偵測到 anystyle: {final_check}")
-        else:
-            print("❌ 警告：即使設定了路徑，仍然找不到 anystyle。")
             
     except Exception as e:
         print(f"❌ 路徑設定發生錯誤: {e}")
+        
+    st.session_state["anystyle_setup_done"] = True
 
-# 在匯入其他模組前，先執行環境設定
+# 執行安裝檢查
 install_and_setup_anystyle()
 
-# === 以下維持原有的模組匯入與程式邏輯 ===
+# ==============================================================================
+# 2. 匯入自定義模組 (包含錯誤處理)
+# ==============================================================================
 try:
     from modules.parsers import parse_references_with_anystyle
-#from modules.local_db import load_csv_data, search_local_database
-#from modules.api_clients import (
-#    get_scopus_key,
-#    get_serpapi_key,
-#    search_crossref_by_doi,
-#    search_crossref_by_text,
-#    search_scopus_by_title,
-#    search_scholar_by_title,
-#    search_scholar_by_ref_text,
-#    search_s2_by_title,
-#    search_openalex_by_title,
-#    check_url_availability
-#)
+    from modules.local_db import load_csv_data, search_local_database
+    from modules.api_clients import (
+        get_scopus_key,
+        get_serpapi_key,
+        search_crossref_by_doi,
+        search_crossref_by_text,
+        search_scopus_by_title,
+        search_scholar_by_title,
+        search_scholar_by_ref_text,
+        search_s2_by_title,
+        search_openalex_by_title,
+        check_url_availability
+    )
+except ModuleNotFoundError as e:
+    # 這裡就是您原本缺少 except 的地方
+    st.error(f"❌ 程式啟動失敗：找不到必要的模組檔案。請檢查 'modules' 資料夾是否已完整上傳。\n錯誤訊息: {e}")
+    st.stop()
 
-# ========== Page Config & Style ==========
+# ==============================================================================
+# 3. Streamlit 頁面設定與主程式
+# ==============================================================================
 st.set_page_config(
     page_title="Citation Verification Report Tool",
     page_icon="📊",
@@ -125,7 +131,7 @@ def refine_parsed_data(parsed_item):
     item = parsed_item.copy()
     raw_text = item.get('text', '').strip()
 
-    raw_text = item.get('text', '')
+    # 如果沒有 URL，嘗試從文字中抓取
     if not item.get('url'):
         url_match = re.search(r'(https?://[^\s]+)', raw_text)
         if url_match:
@@ -137,6 +143,7 @@ def refine_parsed_data(parsed_item):
 
     title = item.get('title', '')
 
+    # 修正 title 開頭為 "&" 或 "and" 的情況
     if title and (title.startswith('&') or title.lower().startswith('and ')):
         fix_match = re.search(
             r'^&(?:amp;)?\s*[^0-9]+?\(?\d{4}\)?[\.\s]+(.*)',
@@ -154,6 +161,7 @@ def refine_parsed_data(parsed_item):
         title = re.sub(r'(?i)\.?\s*Available.*$', '', title)
         item['title'] = title
 
+    # 如果 title 太短或遺失，嘗試使用其他欄位 fallback
     if not title or len(title) < 5:
         abbr_match = re.search(
             r'^([A-Z0-9\-\.\s]{2,12}:\s*.+?)(?=\s*[,\[]|\s*Available|\s*\(|\bhttps?://|\.|$)',
@@ -215,6 +223,7 @@ def check_single_task(idx, raw_ref, local_df, target_col, scopus_key, serpapi_ke
         "suggestion": None
     }
 
+    # 0. Local Database Check
     if bool(re.search(r'[\u4e00-\u9fff]', search_query)) and local_df is not None and title:
         match_row, _ = search_local_database(
             local_df, target_col, title, threshold=0.85
@@ -226,6 +235,7 @@ def check_single_task(idx, raw_ref, local_df, target_col, scopus_key, serpapi_ke
             })
             return res
 
+    # 1. DOI Check
     if doi:
         _, url, _ = search_crossref_by_doi(
             doi, target_title=title if title else None
@@ -237,6 +247,7 @@ def check_single_task(idx, raw_ref, local_df, target_col, scopus_key, serpapi_ke
             })
             return res
 
+    # 1. Crossref Search
     url, _ = search_crossref_by_text(search_query, first_author)
     if url:
         res.update({
@@ -245,6 +256,7 @@ def check_single_task(idx, raw_ref, local_df, target_col, scopus_key, serpapi_ke
         })
         return res
 
+    # 2. Scopus
     if scopus_key:
         url, _ = search_scopus_by_title(
             search_query, scopus_key, author=first_author
@@ -256,6 +268,7 @@ def check_single_task(idx, raw_ref, local_df, target_col, scopus_key, serpapi_ke
             })
             return res
 
+    # 5. Google Scholar
     for api_func, step_name in [
         (lambda: search_scholar_by_title(
             search_query,
@@ -275,6 +288,7 @@ def check_single_task(idx, raw_ref, local_df, target_col, scopus_key, serpapi_ke
         except:
             pass
 
+    # SerpAPI fallback suggestion
     if serpapi_key:
         url_r, _ = search_scholar_by_ref_text(
             text, serpapi_key, target_title=title
@@ -282,6 +296,7 @@ def check_single_task(idx, raw_ref, local_df, target_col, scopus_key, serpapi_ke
         if url_r:
             res["suggestion"] = url_r
 
+    # 6. Direct Link Check
     if parsed_url and parsed_url.startswith('http'):
         if check_url_availability(parsed_url):
             res.update({
