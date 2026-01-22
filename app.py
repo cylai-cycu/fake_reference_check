@@ -622,6 +622,24 @@ if "results" in st.session_state and st.session_state.results:
     c2.metric("資料庫驗證成功", verified)
     c3.metric("需人工確認", total - verified)
 
-    # 下載 CSV
+# 下載 CSV
     df_export = pd.DataFrame([{
         "ID": r['id'],
+        "Status": r['found_at_step'] or "Not Found",
+        "Title": r['title'],
+        "Source": next(iter(r['sources'].values()), "N/A") if r['sources'] else "N/A",
+        "Original": r['text']
+    } for r in st.session_state.results])
+    
+    st.download_button("📥 下載報告 (CSV)", df_export.to_csv(index=False).encode('utf-8-sig'), "report.csv", "text/csv")
+
+    # 詳細列表
+    st.markdown("### 📝 詳細結果")
+    for item in st.session_state.results:
+        step = item.get('found_at_step', '')
+        icon = "✅" if step and "Failed" not in step else "❌"
+        with st.expander(f"{icon} [{item['id']}] {item['title']}"):
+            st.write(f"**狀態**: {step or '未找到'}")
+            st.write(f"**原始文字**: {item['text']}")
+            if item.get('sources'): st.write(f"**連結**: {item['sources']}")
+            if item.get('suggestion'): st.warning(f"💡 建議參考: {item['suggestion']}")
