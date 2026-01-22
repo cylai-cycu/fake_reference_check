@@ -444,12 +444,46 @@ def search_scholar_by_ref_text(ref_text, api_key, target_title=None):
 
 def check_url_availability(url):
     if not url or not url.startswith("http"): return False
+    
+    # 過濾明顯非論文頁面的短網址 (例如純首頁)
     if url.count('/') < 3: return False
+    
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    
+    # 偽裝成一般瀏覽器的 User-Agent
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    
     try:
-        resp = requests.head(url, timeout=5, allow_redirects=True, verify=False)
-        return 200 <= resp.status_code < 400
-    except: return False
+        # 1. 先嘗試 HEAD 請求 (較快)
+        resp = requests.head(
+            url, 
+            headers=headers, 
+            timeout=5, 
+            allow_redirects=True, 
+            verify=False
+        )
+        if 200 <= resp.status_code < 400:
+            return True
+            
+        # 2. 如果 HEAD 失敗 (例如 403/404/405)，嘗試 GET 請求 (較慢但準確)
+        # 很多學術網站不支援 HEAD
+        resp = requests.get(
+            url, 
+            headers=headers, 
+            timeout=8, # GET 比較慢，給多一點時間
+            allow_redirects=True, 
+            verify=False,
+            stream=True # 只下載標頭和一點點內容，不用下載整頁
+        )
+        if 200 <= resp.status_code < 400:
+            return True
+            
+    except Exception:
+        pass
+        
+    return False
 
 # ==============================================================================
 # 5. 主程式核心邏輯 (check_single_task)
@@ -634,12 +668,23 @@ if "results" in st.session_state and st.session_state.results:
     st.download_button("📥 下載報告 (CSV)", df_export.to_csv(index=False).encode('utf-8-sig'), "report.csv", "text/csv")
 
     # 詳細列表
-    st.markdown("### 📝 詳細結果")
+st.markdown("### 📝 詳細結果")
     for item in st.session_state.results:
         step = item.get('found_at_step', '')
-        icon = "✅" if step and "Failed" not in step else "❌"
+        # 如果是 Parse Error，顯示紅色警示
+        icon = "❌" if "Parse Error" in item['title'] or (step and "Failed" in step) or not step else "✅"
+        
         with st.expander(f"{icon} [{item['id']}] {item['title']}"):
+            # 1. 如果有錯誤訊息，優先顯示 (這是除錯的關鍵！)
+            if item.get('error'):
+                st.error(f"🔧 系統錯誤訊息: {item['error']}")
+                st.info("💡 提示: 如果是 'No such file'，請確認 packages.txt 是否存在並已 Reboot App。")
+
             st.write(f"**狀態**: {step or '未找到'}")
             st.write(f"**原始文字**: {item['text']}")
-            if item.get('sources'): st.write(f"**連結**: {item['sources']}")
-            if item.get('suggestion'): st.warning(f"💡 建議參考: {item['suggestion']}")
+            
+            if item.get('sources'): 
+                st.write(f"**連結**: {item['sources']}")
+                
+            if item.get('suggestion'): 
+                st.warning(f"💡 建議參考: {item['suggestion']}")
